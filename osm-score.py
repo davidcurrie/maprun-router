@@ -1,14 +1,24 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "ortools>=9.14",
+#     "osmnx[neighbors,visualization]>=2.0",
+#     "networkx>=3.0",
+#     "numpy>=2.0",
+#     "shapely>=2.0",
+# ]
+# ///
+
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 import shapely.geometry
-from shapely.ops import split as shapely_split
-from shapely.ops import snap
+from shapely.ops import substring
 
+import matplotlib.pyplot as plt
 import numpy as np
 import osmnx as ox
 import networkx as nx
 import xml.etree.ElementTree as ET
-from math import radians, sin, cos, sqrt, atan2
 
 def parse_kml_coordinates(filepath):
     """
@@ -39,67 +49,113 @@ def bbox(coordinates, padding=0.005):
     return (min(lons) - padding, min(lats) - padding,
             max(lons) + padding, max(lats) + padding)
 
-def add_node_on_edge(graph, lon, lat):
-    # Find nearest edge
-    u, v, key = ox.nearest_edges(graph, lon, lat)
-    edge_data = graph.get_edge_data(u, v, key)
+def edge_geometry(graph, u, v, data):
+    """
+    Returns the geometry of an edge, constructing it if necessary.
+    OSMnx only stores a geometry for edges that are not a straight line between
+    their end nodes, so for the rest we build that line from the node positions.
+    """
+    if 'geometry' in data:
+        return data['geometry']
+    return shapely.geometry.LineString([
+        (graph.nodes[u]['x'], graph.nodes[u]['y']),
+        (graph.nodes[v]['x'], graph.nodes[v]['y']),
+    ])
 
-    # Get geometry of the edge
-    if 'geometry' not in edge_data: # TODO why does this happen?
-        print(f"Edge {u}-{v} key {key} has no geometry, skipping")
-        return
-    line = edge_data['geometry']
-    # Project placemark onto the edge
-    placemark_point = shapely.geometry.Point(lon, lat)
-    projected_point = line.interpolate(line.project(placemark_point))
-    snapped_point = snap(projected_point, line, tolerance=0.0001)
-    # Remove the original edge
-    graph.remove_edge(u, v, key)
+def add_node_on_edge(graph, x, y):
+    """
+    Inserts a node at the point on the nearest edge closest to (x, y), splitting
+    every edge between that edge's end nodes in both directions. Coordinates are
+    in the graph's projected CRS.
+    Returns the new node, or None if the point projects onto an existing node.
+    """
+    u, v, key = ox.nearest_edges(graph, x, y)
+    line = edge_geometry(graph, u, v, graph.edges[u, v, key])
+    offset = line.project(shapely.geometry.Point(x, y))
+    if not 0 < offset < line.length:
+        return None  # the closest point is an end node, so there is nothing to split
+    # Take the split point from the geometry itself so that it lies exactly on the line
+    node_x, node_y = substring(line, 0, offset).coords[-1]
+    new_node = max(graph.nodes) + 1
+    graph.add_node(new_node, x=node_x, y=node_y)
 
-    # Repeat for the reverse direction
-    u2, v2, key2 = ox.nearest_edges(graph, lon, lat)
-    edge_data2 = graph.get_edge_data(u2, v2, key2)
-    # Get geometry of the edge
-    line2 = edge_data2['geometry']
-    # Remove the original edge
-    graph.remove_edge(u2, v2, key2)
+    point = shapely.geometry.Point(node_x, node_y)
+    for a, b in ((u, v), (v, u)):
+        for k, data in list((graph.get_edge_data(a, b) or {}).items()):
+            geometry = edge_geometry(graph, a, b, data)
+            along = geometry.project(point)
+            if not 0 < along < geometry.length:
+                continue
+            head = substring(geometry, 0, along)
+            tail = substring(geometry, along, geometry.length)
+            # Divide the recorded length in proportion to the geometry so that
+            # the two new lengths still sum to the length of the original edge
+            scale = data['length'] / geometry.length
+            attributes = {n: w for n, w in data.items() if n not in ('geometry', 'length')}
+            graph.remove_edge(a, b, k)
+            graph.add_edge(a, new_node, geometry=head,
+                           length=head.length * scale, **attributes)
+            graph.add_edge(new_node, b, geometry=tail,
+                           length=tail.length * scale, **attributes)
+    return new_node
 
-    # Add new node at snapped_point
-    new_node = max(graph.nodes) + 1  # or use a unique id
-    graph.add_node(new_node, x=snapped_point.x, y=snapped_point.y)
+def plot_controls(ax, points, visited):
+    """
+    Draws the controls on top of a plotted graph, distinguishing the start and
+    finish from the rest, and the controls the route visits from those it misses.
+    Points are keyed by control code and given in the graph's projected CRS.
+    """
+    def scatter(names, label, **style):
+        if names:
+            ax.scatter([points[name].x for name in names],
+                       [points[name].y for name in names],
+                       label=label, zorder=3, **style)
 
-    # Split the edge geometry
-    lines = shapely_split(line, snapped_point).geoms
-    if len(lines) != 2:
-        print("Edge split did not produce two LineStrings") # TODO why?
-        return
-    # Add new edges
-    graph.add_edge(u, new_node, length=lines[0].length, geometry=lines[0])
-    graph.add_edge(new_node, v, length=lines[1].length, geometry=lines[1])
+    controls = [name for name in points if name not in ('S1', 'F1')]
+    scatter([name for name in points if name in ('S1', 'F1')],
+            'Start/finish', marker='*', s=350, c='#ff00ff')
+    scatter([name for name in controls if name in visited],
+            'Control on route', marker='o', s=70, c='#ff00ff')
+    scatter([name for name in controls if name not in visited],
+            'Control not on route', marker='o', s=70,
+            facecolors='none', edgecolors='#ff00ff', linewidths=1.5)
 
-    # Split the edge geometry
-    lines2 = shapely_split(line2, snapped_point).geoms
-    if len(lines) != 2:
-        print("Edge split did not produce two LineStrings") # TODO why?
-        return
-    # Add new edges
-    graph.add_edge(u2, new_node, length=lines2[0].length, geometry=lines2[0])
-    graph.add_edge(new_node, v2, length=lines2[1].length, geometry=lines2[1])
+    # Group the labels by position so that controls sharing one, such as a start
+    # and finish in the same place, do not have their codes drawn on top of one
+    # another
+    labels = {}
+    for name, point in points.items():
+        labels.setdefault((round(point.x, 1), round(point.y, 1)), []).append(name)
+    for (x, y), names in labels.items():
+        ax.annotate('/'.join(names), (x, y), textcoords='offset points',
+                    xytext=(7, 7), color='white', fontsize=8, zorder=4,
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor='#111111',
+                              edgecolor='none', alpha=0.75))
+
+    ax.legend(loc='upper right', facecolor='#111111',
+              labelcolor='white', framealpha=0.8)
 
 
 control_coordinates = parse_kml_coordinates('course.kml')
 control_codes = list(control_coordinates.keys())
 
-# Download the street network for the area
-graph = ox.graph_from_bbox(bbox(control_coordinates.values()))
+# Download the street network for the area and project it so that all the
+# geometry and nearest-neighbour searches below work in metres
+graph = ox.project_graph(ox.graph_from_bbox(bbox(control_coordinates.values())))
+
+# Project the control coordinates into the same CRS as the graph
+control_points, _ = ox.projection.project_geometry(
+    shapely.geometry.MultiPoint(list(control_coordinates.values())),
+    to_crs=graph.graph['crs'])
+control_points = dict(zip(control_codes, control_points.geoms))
 
 # Find the nearest node in the graph for each placemark
 control_nodes = {}
-for name, (lon, lat) in control_coordinates.items():
-    node, distance = ox.nearest_nodes(graph, lon, lat, return_dist=True)
+for name, point in control_points.items():
+    node, distance = ox.nearest_nodes(graph, point.x, point.y, return_dist=True)
     if distance > 10:
-        add_node_on_edge(graph, lon, lat)
-        node, distance = ox.nearest_nodes(graph, lon, lat, return_dist=True)
+        add_node_on_edge(graph, point.x, point.y)
+        node, distance = ox.nearest_nodes(graph, point.x, point.y, return_dist=True)
     control_nodes[name] = node
 
 # Build a distance matrix using network distances
@@ -126,7 +182,7 @@ for i in range(size):
 start_idx = control_codes.index('S1')
 finish_idx = control_codes.index('F1')
 
-max_distance = 9000  # distance in metres
+max_distance = 9_000  # distance in metres
 
 def get_score(name):
     try:
@@ -218,12 +274,17 @@ if solution:
         total_distance += routing.GetArcCostForVehicle(previous_index, index, 0)
     plan.append(manager.IndexToNode(index))
     route = [control_codes[i] for i in plan]
-    print(f"OR-Tools route: {' -> '.join(route)}")
-    print(f"Total score: {total_score}")
-    print(f"Total distance: {total_distance:.2f} metres")
+    print(f"Route: {' -> '.join(route)}")
+    print(f"Score: {total_score}")
+    print(f"Distance: {total_distance:.2f} metres")
 
     route_paths = [shortest_paths[plan[i], plan[i+1]] for i in range(len(plan)-1)]
-    figure, ax = ox.plot_graph_routes(graph, route_paths)
-    
+    # orig_dest_size=0 suppresses the marker OSMnx puts at each end of every leg,
+    # leaving plot_controls to mark the controls in one consistent style
+    figure, ax = ox.plot_graph_routes(graph, route_paths, orig_dest_size=0,
+                                      show=False, close=False)
+    plot_controls(ax, control_points, {control_codes[i] for i in plan})
+    plt.show()
+
 else:
     print("No solution found!")
